@@ -1,5 +1,7 @@
 import "@/lib/polyfillPromiseWithResolvers";
 import "@/lib/polyfillImageData";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { createCanvas, type Canvas, type SKRSContext2D } from "@napi-rs/canvas";
 
 import { convertLog, convertLogError } from "@/lib/convertPipelineLog";
@@ -61,14 +63,29 @@ export async function renderPdfPagesToPngBuffers(
     canvasBackend: "@napi-rs/canvas",
   });
 
-  let pdfjs: typeof import("pdfjs-dist/legacy/build/pdf.mjs");
+  type PdfjsLegacy = typeof import("pdfjs-dist/legacy/build/pdf.mjs");
+  let pdfjs: PdfjsLegacy;
   try {
     convertLog("pdf", "import.pdfjs.legacy");
-    pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+    pdfjs = (await import("pdfjs-dist/legacy/build/pdf.mjs")) as unknown as PdfjsLegacy;
   } catch (e) {
     convertLogError("pdf", e, { phase: "import.pdfjs.legacy" });
     throw e;
   }
+
+  // Node uses a "fake worker" that dynamic-import()s this file; default "./pdf.worker.mjs"
+  // breaks under Next/Vercel tracing. Use an absolute file URL (avoid require.resolve so webpack
+  // does not try to bundle the worker) + `outputFileTracingIncludes` in next.config.ts.
+  const workerDiskPath = path.join(
+    process.cwd(),
+    "node_modules",
+    "pdfjs-dist",
+    "legacy",
+    "build",
+    "pdf.worker.mjs",
+  );
+  pdfjs.GlobalWorkerOptions.workerSrc = pathToFileURL(workerDiskPath).href;
+  convertLog("pdf", "workerSrc.set", { workerSrc: pdfjs.GlobalWorkerOptions.workerSrc });
 
   const data = new Uint8Array(pdfBuffer);
   convertLog("pdf", "getDocument.start", { dataBytes: data.length });
