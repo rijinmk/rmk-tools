@@ -14,7 +14,6 @@ export function getVisionServiceAccountCredentials(): Record<string, string> {
   const privateKey = privateKeyRaw.replace(/\\n/g, "\n");
 
   return {
-    type: requireEnv("VISION_CREDENTIALS_TYPE"),
     project_id: requireEnv("VISION_CREDENTIALS_PROJECT_ID"),
     private_key_id: requireEnv("VISION_CREDENTIALS_PRIVATE_KEY_ID"),
     private_key: privateKey,
