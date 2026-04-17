@@ -13,7 +13,7 @@ export function getVisionServiceAccountCredentials(): Record<string, string> {
   const privateKeyRaw = requireEnv("VISION_CREDENTIALS_PRIVATE_KEY");
   const privateKey = privateKeyRaw.replace(/\\n/g, "\n");
 
-  const creds: Record<string, string> = {
+  return {
     type: requireEnv("VISION_CREDENTIALS_TYPE"),
     project_id: requireEnv("VISION_CREDENTIALS_PROJECT_ID"),
     private_key_id: requireEnv("VISION_CREDENTIALS_PRIVATE_KEY_ID"),
@@ -21,11 +21,4 @@ export function getVisionServiceAccountCredentials(): Record<string, string> {
     client_email: requireEnv("VISION_CREDENTIALS_CLIENT_EMAIL"),
     client_id: requireEnv("VISION_CREDENTIALS_CLIENT_ID"),
   };
-
-  const universe = process.env.VISION_CREDENTIALS_UNIVERSE_DOMAIN?.trim();
-  if (universe) {
-    creds.universe_domain = universe;
-  }
-
-  return creds;
 }
