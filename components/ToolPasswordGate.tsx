@@ -61,6 +61,9 @@ export function ToolPasswordGate({ children, toolTitle }: Props) {
         }
         setPassword("");
         setPhase("unlocked");
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(new Event("rmk-tools-session"));
+        }
       } catch {
         setError("Something went wrong. Please try again.");
       }

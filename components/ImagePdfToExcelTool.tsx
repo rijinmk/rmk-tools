@@ -53,8 +53,11 @@ type PipelineStage = "ocr" | "claude" | "excel";
 const QUEUE_EXIT_MS = 320;
 const QUEUE_ENTER_TRANSITION = "duration-300 ease-out";
 
-/** Vercel serverless rejects multipart bodies roughly over ~4.5 MB unless files go direct to Blob. */
-const HOSTED_REQUEST_WARNING_BYTES = 4_000_000;
+/** Stay under Vercel’s ~4.5 MB multipart cap (multipart boundaries add a lot of overhead). */
+const MULTIPART_SAFE_TOTAL_BYTES = 2_500_000;
+
+/** Warn in the queue UI above this size when Blob is not available. */
+const HOSTED_REQUEST_WARNING_BYTES = 2_500_000;
 
 const BLOB_PATH_PREFIX = "flyer-uploads/";
 
@@ -86,10 +89,15 @@ export function ImagePdfToExcelTool() {
   const isBusy = phase === "uploading";
 
   useEffect(() => {
-    void fetch("/api/blobs/ready", { credentials: "include" })
-      .then((r) => r.json() as Promise<{ clientUpload?: boolean }>)
-      .then((d) => setBlobDirectUpload(Boolean(d.clientUpload)))
-      .catch(() => setBlobDirectUpload(false));
+    const load = () => {
+      void fetch("/api/blobs/ready", { credentials: "include" })
+        .then((r) => r.json() as Promise<{ clientUpload?: boolean }>)
+        .then((d) => setBlobDirectUpload(Boolean(d.clientUpload)))
+        .catch(() => setBlobDirectUpload(false));
+    };
+    load();
+    window.addEventListener("rmk-tools-session", load);
+    return () => window.removeEventListener("rmk-tools-session", load);
   }, []);
 
   const revokeBlobUrl = useCallback(() => {
@@ -140,11 +148,39 @@ export function ImagePdfToExcelTool() {
       let res: Response;
       let usedBlobUploadPath = false;
       try {
+        const totalBytes = files.reduce((sum, f) => sum + f.size, 0);
         const readyRes = await fetch("/api/blobs/ready", { credentials: "include" });
-        const readyJson = (await readyRes.json()) as { clientUpload?: boolean };
-        const useBlob = Boolean(readyJson.clientUpload);
+        const readyJson = (await readyRes.json()) as {
+          clientUpload?: boolean;
+          toolUnlocked?: boolean;
+          blobTokenSet?: boolean;
+        };
+        const blobOk = Boolean(readyJson.clientUpload);
+        const toolUnlocked = readyJson.toolUnlocked !== false;
+        const blobTokenSet = Boolean(readyJson.blobTokenSet);
 
-        if (useBlob) {
+        if (totalBytes > MULTIPART_SAFE_TOTAL_BYTES && !blobOk) {
+          const sizeMb = (totalBytes / (1024 * 1024)).toFixed(1);
+          if (!toolUnlocked) {
+            throw new Error(
+              `This batch is about ${sizeMb} MB. Unlock the tool again (password), then retry so the app can use Blob uploads.`,
+            );
+          }
+          if (!blobTokenSet) {
+            throw new Error(
+              [
+                `This batch is about ${sizeMb} MB. Vercel blocks the normal upload path over ~4.5 MB.`,
+                "",
+                "Fix (one-time): Vercel → your project → Storage → Blob → create or connect a store linked to this project. That injects BLOB_READ_WRITE_TOKEN (or VERCEL_BLOB_READ_WRITE_TOKEN) for Production — check Settings → Environment Variables after linking.",
+                "Then: Deployments → Redeploy. Open this tool, enter the password again, and run Generate.",
+                "",
+                "Local: add BLOB_READ_WRITE_TOKEN to .env (vercel env pull) or run npm run dev without deploying.",
+              ].join("\n"),
+            );
+          }
+        }
+
+        if (blobOk) {
           usedBlobUploadPath = true;
           const { upload } = await import("@vercel/blob/client");
           const blobFiles: { url: string; name: string }[] = [];

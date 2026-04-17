@@ -2,6 +2,7 @@ import { handleUpload, type HandleUploadBody } from "@vercel/blob/client";
 import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
 
+import { getBlobReadWriteToken } from "@/lib/blobEnv";
 import { MAX_BYTES_PER_FILE } from "@/lib/convertInputs";
 import { isToolUnlocked, TOOL_UNLOCK_COOKIE } from "@/lib/toolAuth";
 
@@ -10,11 +11,12 @@ export const runtime = "nodejs";
 const UPLOAD_PATH_PREFIX = "flyer-uploads/";
 
 export async function POST(request: Request) {
-  if (!process.env.BLOB_READ_WRITE_TOKEN?.trim()) {
+  const blobToken = getBlobReadWriteToken();
+  if (!blobToken) {
     return NextResponse.json(
       {
         error:
-          "Missing BLOB_READ_WRITE_TOKEN. In Vercel: Storage → Blob → create store and connect env vars.",
+          "Missing BLOB_READ_WRITE_TOKEN (or VERCEL_BLOB_READ_WRITE_TOKEN). In Vercel: Storage → Blob → create/link a store so the token is injected, then redeploy.",
       },
       { status: 503 },
     );
@@ -43,7 +45,7 @@ export async function POST(request: Request) {
     const jsonResponse = await handleUpload({
       request,
       body,
-      token: process.env.BLOB_READ_WRITE_TOKEN,
+      token: blobToken,
       onBeforeGenerateToken: async (pathname) => {
         if (!pathname.startsWith(UPLOAD_PATH_PREFIX)) {
           throw new Error(`Invalid pathname (must start with ${UPLOAD_PATH_PREFIX}).`);

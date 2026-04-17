@@ -2,6 +2,7 @@ import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
 
 import { convertLog, convertLogError } from "@/lib/convertPipelineLog";
+import { getBlobReadWriteToken } from "@/lib/blobEnv";
 import { prepareSourceFiles } from "@/lib/convertInputs";
 import { isToolUnlocked, TOOL_UNLOCK_COOKIE } from "@/lib/toolAuth";
 import {
@@ -267,11 +268,12 @@ Hard rules:
     pipelineStep = "done";
     convertLog("api", "request.success", { downloadName });
 
-    if (blobUrlsToDelete.length > 0 && process.env.BLOB_READ_WRITE_TOKEN?.trim()) {
+    const blobRw = getBlobReadWriteToken();
+    if (blobUrlsToDelete.length > 0 && blobRw) {
       pipelineStep = "blob:cleanup";
       try {
         const { del } = await import("@vercel/blob");
-        const token = process.env.BLOB_READ_WRITE_TOKEN;
+        const token = blobRw;
         await Promise.all(
           blobUrlsToDelete.map((url) =>
             del(url, { token }).catch(() => {
