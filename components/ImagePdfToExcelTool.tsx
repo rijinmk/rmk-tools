@@ -53,8 +53,10 @@ type PipelineStage = "ocr" | "claude" | "excel";
 const QUEUE_EXIT_MS = 320;
 const QUEUE_ENTER_TRANSITION = "duration-300 ease-out";
 
-/** Vercel (and similar) reject the whole HTTP request around ~4.5 MB; `next dev` does not. */
+/** Vercel serverless rejects multipart bodies roughly over ~4.5 MB unless files go direct to Blob. */
 const HOSTED_REQUEST_WARNING_BYTES = 4_000_000;
+
+const BLOB_PATH_PREFIX = "flyer-uploads/";
 
 function pipelineStageFromElapsed(ms: number): PipelineStage {
   if (ms < 22_000) return "ocr";
@@ -79,8 +81,16 @@ export function ImagePdfToExcelTool() {
   const [runPanelVisible, setRunPanelVisible] = useState(false);
   const [uploadTick, setUploadTick] = useState(0);
   const [convertFileCount, setConvertFileCount] = useState(0);
+  const [blobDirectUpload, setBlobDirectUpload] = useState(false);
 
   const isBusy = phase === "uploading";
+
+  useEffect(() => {
+    void fetch("/api/blobs/ready", { credentials: "include" })
+      .then((r) => r.json() as Promise<{ clientUpload?: boolean }>)
+      .then((d) => setBlobDirectUpload(Boolean(d.clientUpload)))
+      .catch(() => setBlobDirectUpload(false));
+  }, []);
 
   const revokeBlobUrl = useCallback(() => {
     setExcelBlobUrl((prev) => {
@@ -127,17 +137,46 @@ export function ImagePdfToExcelTool() {
       revokeBlobUrl();
       setPhase("uploading");
 
-      const form = new FormData();
-      for (const file of files) {
-        form.append("files", file);
-      }
-
+      let res: Response;
+      let usedBlobUploadPath = false;
       try {
-        const res = await fetch("/api/convert", {
-          method: "POST",
-          body: form,
-          credentials: "include",
-        });
+        const readyRes = await fetch("/api/blobs/ready", { credentials: "include" });
+        const readyJson = (await readyRes.json()) as { clientUpload?: boolean };
+        const useBlob = Boolean(readyJson.clientUpload);
+
+        if (useBlob) {
+          usedBlobUploadPath = true;
+          const { upload } = await import("@vercel/blob/client");
+          const blobFiles: { url: string; name: string }[] = [];
+          for (let i = 0; i < files.length; i += 1) {
+            const file = files[i];
+            const safeName = file.name.replace(/[^\w.\-()+ ]/g, "_").slice(0, 160);
+            const pathname = `${BLOB_PATH_PREFIX}${Date.now()}-${i}-${safeName}`;
+            const uploaded = await upload(pathname, file, {
+              access: "public",
+              handleUploadUrl: "/api/blobs/client-upload",
+              multipart: file.size >= 4 * 1024 * 1024,
+              contentType: file.type || undefined,
+            });
+            blobFiles.push({ url: uploaded.url, name: file.name });
+          }
+          res = await fetch("/api/convert", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ blobFiles }),
+            credentials: "include",
+          });
+        } else {
+          const form = new FormData();
+          for (const file of files) {
+            form.append("files", file);
+          }
+          res = await fetch("/api/convert", {
+            method: "POST",
+            body: form,
+            credentials: "include",
+          });
+        }
 
         const rawText = await res.text();
         let payload: unknown = null;
@@ -165,7 +204,9 @@ export function ImagePdfToExcelTool() {
           const preview = rawText.replace(/\s+/g, " ").trim().slice(0, 280);
           const hint =
             res.status === 413
-              ? "Payload too large for the host (try fewer/smaller files)."
+              ? usedBlobUploadPath
+                ? "Request was still too large (unexpected)."
+                : "Payload too large for this host (~4.5 MB). In Vercel: add a Blob store and BLOB_READ_WRITE_TOKEN so uploads go direct to Blob, or use fewer/smaller files / npm run dev locally."
               : res.status === 504 || res.status === 502
                 ? "Gateway timeout or bad gateway — conversion may exceed serverless limits; check Vercel function logs and maxDuration."
                 : "Often HTML from a proxy or an empty body when JSON was expected.";
@@ -334,7 +375,7 @@ export function ImagePdfToExcelTool() {
 
   const hint = useMemo(
     () =>
-      `Add multiple PDFs and/or images (PNG, JPEG, WebP, GIF). Up to ${25} files, 30 MB each. You will get one .xlsx with one row per file. On Vercel, the full request must stay under ~4.5 MB (local dev has no such cap).`,
+      `Add multiple PDFs and/or images (PNG, JPEG, WebP, GIF). Up to ${25} files, 30 MB each. One .xlsx row per file. On Vercel, set BLOB_READ_WRITE_TOKEN so large batches upload directly to Blob (otherwise the whole request is capped near ~4.5 MB).`,
     [],
   );
 
@@ -343,7 +384,8 @@ export function ImagePdfToExcelTool() {
     [queue],
   );
 
-  const queueLikelyTooLargeForVercel = queueTotalBytes > HOSTED_REQUEST_WARNING_BYTES;
+  const queueLikelyTooLargeForVercel =
+    queueTotalBytes > HOSTED_REQUEST_WARNING_BYTES && !blobDirectUpload;
 
   const queueCardMotion = queueExiting
     ? "pointer-events-none opacity-0 translate-y-2 scale-[0.99]"
@@ -431,10 +473,10 @@ export function ImagePdfToExcelTool() {
               </p>
               {queueLikelyTooLargeForVercel ? (
                 <p className="mt-2 rounded-lg border border-amber-500/35 bg-amber-500/10 px-2.5 py-2 text-xs text-amber-100/95">
-                  Total {formatBytes(queueTotalBytes)}: many hosts (e.g. Vercel) return{" "}
-                  <strong className="font-semibold">413</strong> if the whole upload is over ~4.5 MB.
-                  Use fewer or smaller files, split runs, or run <code className="rounded bg-black/20 px-1">npm run dev</code>{" "}
-                  locally—local Next.js does not apply that limit.
+                  Total {formatBytes(queueTotalBytes)}: without Vercel Blob, many hosts return{" "}
+                  <strong className="font-semibold">413</strong> (~4.5 MB request cap). Add{" "}
+                  <code className="rounded bg-black/20 px-1">BLOB_READ_WRITE_TOKEN</code> on the server,
+                  split runs, or use <code className="rounded bg-black/20 px-1">npm run dev</code> locally.
                 </p>
               ) : null}
             </div>
