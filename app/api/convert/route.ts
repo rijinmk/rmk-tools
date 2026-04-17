@@ -1,6 +1,8 @@
+import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
 
 import { convertLog, convertLogError } from "@/lib/convertPipelineLog";
+import { isToolUnlocked, TOOL_UNLOCK_COOKIE } from "@/lib/toolAuth";
 import {
   collectTextFromMessage,
   getAnthropicClient,
@@ -92,6 +94,24 @@ export async function POST(req: Request) {
   let pipelineStep = "start";
   try {
     convertLog("api", "request.received", {});
+    pipelineStep = "check-tool-unlock";
+    if (!process.env.PASSWORD?.trim()) {
+      return NextResponse.json(
+        { error: "Server is missing PASSWORD. Set it in your environment file." },
+        { status: 503 },
+      );
+    }
+    const cookieStore = await cookies();
+    if (!isToolUnlocked(cookieStore.get(TOOL_UNLOCK_COOKIE)?.value)) {
+      return NextResponse.json(
+        {
+          error: "Unauthorized. Enter the tool password on the tool page first.",
+          pipelineStep,
+        },
+        { status: 401 },
+      );
+    }
+
     pipelineStep = "check-anthropic-key";
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey) {

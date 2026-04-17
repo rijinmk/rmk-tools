@@ -14,6 +14,37 @@ const HEADER = [
   "Arabic Description & Terms",
 ];
 
+/** Excel column `width` is in character units; used to approximate wrapped lines. */
+const COL_WIDTHS = [36, 36, 68, 68];
+const LINE_HEIGHT_PT = 15.5;
+const ROW_PADDING_PT = 10;
+const MIN_DATA_ROW_PT = 36;
+const MAX_ROW_PT = 400;
+
+function estimateLineCount(text: string, columnWidthChars: number): number {
+  const width = Math.max(8, columnWidthChars);
+  const parts = text.replace(/\r\n/g, "\n").split("\n");
+  let lines = 0;
+  for (const part of parts) {
+    if (part.length === 0) {
+      lines += 1;
+      continue;
+    }
+    lines += Math.max(1, Math.ceil(part.length / width));
+  }
+  return Math.max(1, lines);
+}
+
+function estimateRowHeightPt(values: string[]): number {
+  let maxLines = 1;
+  for (let i = 0; i < values.length; i += 1) {
+    const w = COL_WIDTHS[i] ?? 40;
+    maxLines = Math.max(maxLines, estimateLineCount(values[i] ?? "", w));
+  }
+  const height = ROW_PADDING_PT + maxLines * LINE_HEIGHT_PT;
+  return Math.min(MAX_ROW_PT, Math.max(MIN_DATA_ROW_PT, height));
+}
+
 function sanitizeSheetName(name: string): string {
   const cleaned = name.replace(/[:\\/?*[\]]/g, "_").trim() || "Offers";
   return cleaned.slice(0, 31);
@@ -29,14 +60,17 @@ export async function buildOffersWorkbookBuffer(
   });
 
   ws.columns = [
-    { key: "c1", width: 36 },
-    { key: "c2", width: 36 },
-    { key: "c3", width: 68 },
-    { key: "c4", width: 68 },
+    { key: "c1", width: COL_WIDTHS[0] },
+    { key: "c2", width: COL_WIDTHS[1] },
+    { key: "c3", width: COL_WIDTHS[2] },
+    { key: "c4", width: COL_WIDTHS[3] },
   ];
 
   const headerRow = ws.addRow(HEADER);
-  headerRow.height = 26;
+  headerRow.height = Math.min(
+    MAX_ROW_PT,
+    Math.max(26, estimateRowHeightPt([...HEADER])),
+  );
   headerRow.font = { bold: true, color: { argb: "FFFFFFFF" } };
   headerRow.fill = {
     type: "pattern",
@@ -54,12 +88,14 @@ export async function buildOffersWorkbookBuffer(
   });
 
   rows.forEach((r, idx) => {
-    const row = ws.addRow([
+    const cells = [
       r.englishTitle,
       r.arabicTitle,
       r.englishDescription,
       r.arabicDescription,
-    ]);
+    ];
+    const row = ws.addRow(cells);
+    row.height = estimateRowHeightPt(cells);
     const zebra = idx % 2 === 0 ? "FFF4F4F5" : "FFFFFFFF";
     row.alignment = { wrapText: true, vertical: "top" };
     row.eachCell((cell) => {

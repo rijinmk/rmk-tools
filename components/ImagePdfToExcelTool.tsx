@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 
 type Phase = "idle" | "uploading" | "success" | "error";
@@ -48,8 +48,21 @@ function base64ToBlob(base64: string, mime: string): Blob {
   return new Blob([bytes], { type: mime });
 }
 
+type PipelineStage = "ocr" | "claude" | "excel";
+
+const QUEUE_EXIT_MS = 320;
+const QUEUE_ENTER_TRANSITION = "duration-300 ease-out";
+
+function pipelineStageFromElapsed(ms: number): PipelineStage {
+  if (ms < 22_000) return "ocr";
+  if (ms < 55_000) return "claude";
+  return "excel";
+}
+
 export function ImagePdfToExcelTool() {
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const prevQueueLen = useRef(0);
+  const convertFilesRef = useRef<File[]>([]);
   const [queue, setQueue] = useState<File[]>([]);
   const [phase, setPhase] = useState<Phase>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -58,6 +71,11 @@ export function ImagePdfToExcelTool() {
   const [excelBlobUrl, setExcelBlobUrl] = useState<string | null>(null);
   const [visionDebugJson, setVisionDebugJson] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
+  const [queueExiting, setQueueExiting] = useState(false);
+  const [queueCardVisible, setQueueCardVisible] = useState(false);
+  const [runPanelVisible, setRunPanelVisible] = useState(false);
+  const [uploadTick, setUploadTick] = useState(0);
+  const [convertFileCount, setConvertFileCount] = useState(0);
 
   const isBusy = phase === "uploading";
 
@@ -95,76 +113,163 @@ export function ImagePdfToExcelTool() {
     setQueue([]);
   }, []);
 
-  const handleConvert = useCallback(async () => {
-    if (queue.length === 0) return;
+  const performConvert = useCallback(
+    async (files: File[]) => {
+      if (files.length === 0) return;
 
-    setError(null);
-    setSummary(null);
-    setDownloadName(null);
-    setVisionDebugJson(null);
-    revokeBlobUrl();
-    setPhase("uploading");
+      setError(null);
+      setSummary(null);
+      setDownloadName(null);
+      setVisionDebugJson(null);
+      revokeBlobUrl();
+      setPhase("uploading");
 
-    const form = new FormData();
-    for (const file of queue) {
-      form.append("files", file);
-    }
+      const form = new FormData();
+      for (const file of files) {
+        form.append("files", file);
+      }
 
-    try {
-      const res = await fetch("/api/convert", {
-        method: "POST",
-        body: form,
-      });
+      try {
+        const res = await fetch("/api/convert", {
+          method: "POST",
+          body: form,
+          credentials: "include",
+        });
 
-      const payload: unknown = await res.json().catch(() => null);
-      const obj = payload as Partial<ConvertResponse> & {
-        error?: string;
-        visionDebug?: VisionDebugPayload;
-      };
+        const payload: unknown = await res.json().catch(() => null);
+        const obj = payload as Partial<ConvertResponse> & {
+          error?: string;
+          visionDebug?: VisionDebugPayload;
+        };
 
-      if (!res.ok) {
+        if (!res.ok) {
+          if (obj.visionDebug) {
+            setVisionDebugJson(JSON.stringify(obj.visionDebug, null, 2));
+          }
+          const errObj = obj as { pipelineStep?: string; hint?: string };
+          const parts = [
+            obj?.error || `Request failed (${res.status}).`,
+            errObj.pipelineStep ? `Step: ${errObj.pipelineStep}` : "",
+            errObj.hint || "",
+          ].filter(Boolean);
+          throw new Error(parts.join("\n\n"));
+        }
+
+        if (
+          typeof obj.summary !== "string" ||
+          typeof obj.excelBase64 !== "string" ||
+          typeof obj.downloadName !== "string"
+        ) {
+          throw new Error("Unexpected server response shape.");
+        }
+
         if (obj.visionDebug) {
           setVisionDebugJson(JSON.stringify(obj.visionDebug, null, 2));
         }
-        const errObj = obj as { pipelineStep?: string; hint?: string };
-        const parts = [
-          obj?.error || `Request failed (${res.status}).`,
-          errObj.pipelineStep ? `Step: ${errObj.pipelineStep}` : "",
-          errObj.hint || "",
-        ].filter(Boolean);
-        throw new Error(parts.join("\n\n"));
+
+        const blob = base64ToBlob(
+          obj.excelBase64,
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        );
+        const url = URL.createObjectURL(blob);
+
+        revokeBlobUrl();
+        setExcelBlobUrl(url);
+        setSummary(obj.summary);
+        setDownloadName(obj.downloadName);
+        setPhase("success");
+      } catch (e) {
+        const message =
+          e instanceof Error ? e.message : "Something went wrong. Please try again.";
+        setError(message);
+        setPhase("error");
       }
+    },
+    [revokeBlobUrl],
+  );
 
-      if (
-        typeof obj.summary !== "string" ||
-        typeof obj.excelBase64 !== "string" ||
-        typeof obj.downloadName !== "string"
-      ) {
-        throw new Error("Unexpected server response shape.");
-      }
+  const requestGenerate = useCallback(() => {
+    if (queue.length === 0 || isBusy || queueExiting) return;
+    setConvertFileCount(queue.length);
+    convertFilesRef.current = [...queue];
+    setQueueExiting(true);
+  }, [queue, isBusy, queueExiting]);
 
-      if (obj.visionDebug) {
-        setVisionDebugJson(JSON.stringify(obj.visionDebug, null, 2));
-      }
+  useEffect(() => {
+    if (!queueExiting) return;
+    const t = window.setTimeout(() => {
+      setQueueExiting(false);
+      void performConvert(convertFilesRef.current);
+    }, QUEUE_EXIT_MS);
+    return () => window.clearTimeout(t);
+  }, [queueExiting, performConvert]);
 
-      const blob = base64ToBlob(
-        obj.excelBase64,
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-      );
-      const url = URL.createObjectURL(blob);
+  useEffect(() => {
+    const prev = prevQueueLen.current;
+    prevQueueLen.current = queue.length;
 
-      revokeBlobUrl();
-      setExcelBlobUrl(url);
-      setSummary(obj.summary);
-      setDownloadName(obj.downloadName);
-      setPhase("success");
-    } catch (e) {
-      const message =
-        e instanceof Error ? e.message : "Something went wrong. Please try again.";
-      setError(message);
-      setPhase("error");
+    if (queue.length === 0) {
+      setQueueCardVisible(false);
+      return;
     }
-  }, [queue, revokeBlobUrl]);
+
+    if (prev === 0 && queue.length > 0) {
+      setQueueCardVisible(false);
+      const id = window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(() => setQueueCardVisible(true));
+      });
+      return () => window.cancelAnimationFrame(id);
+    }
+  }, [queue.length]);
+
+  useEffect(() => {
+    if (phase !== "uploading") {
+      setRunPanelVisible(false);
+      return;
+    }
+    setRunPanelVisible(false);
+    const id = window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => setRunPanelVisible(true));
+    });
+    return () => window.cancelAnimationFrame(id);
+  }, [phase]);
+
+  useEffect(() => {
+    if (phase !== "uploading") {
+      setUploadTick(0);
+      return;
+    }
+    setUploadTick(0);
+    const id = window.setInterval(() => setUploadTick((n) => n + 1), 400);
+    return () => window.clearInterval(id);
+  }, [phase]);
+
+  const uploadElapsedMs = phase === "uploading" ? uploadTick * 400 : 0;
+  const activePipelineStage = pipelineStageFromElapsed(uploadElapsedMs);
+
+  const pipelineCopy = useMemo(() => {
+    const n = convertFileCount;
+    const fileWord = n === 1 ? "file" : "files";
+    return {
+      ocr: `Google Cloud Vision is running OCR on ${n} ${fileWord}. Each PDF page is rasterized in Node and sent to Vision as an image; PNG, JPEG, WebP, and GIF are sent directly. Text and layout cues are gathered for every page before the pipeline moves on.`,
+      claude: `Anthropic Claude reads the combined Vision output and produces structured bilingual rows (Arabic and English), one logical row per source ${fileWord} in the same order as your queue. It normalizes headers, merges wrapped lines where appropriate, and prepares cell-ready values for Excel.`,
+      excel: `ExcelJS is generating the downloadable .xlsx: worksheet layout, column widths, wrapped text, zebra striping, and estimated row heights so the workbook opens cleanly in Microsoft Excel or compatible apps.`,
+    } satisfies Record<PipelineStage, string>;
+  }, [convertFileCount]);
+
+  const queueActionsDisabled = isBusy || queueExiting;
+  const showDropzone = queue.length === 0 && !isBusy;
+  const showQueuePanel = queue.length > 0 && (queueExiting || !isBusy);
+  const showAddMore = queue.length > 0 && !isBusy && !queueExiting;
+
+  const stepVisual = (step: PipelineStage) => {
+    const order: PipelineStage[] = ["ocr", "claude", "excel"];
+    const activeIdx = order.indexOf(activePipelineStage);
+    const idx = order.indexOf(step);
+    if (idx < activeIdx) return "done" as const;
+    if (idx === activeIdx) return "active" as const;
+    return "pending" as const;
+  };
 
   const onPickFile = useCallback(() => {
     inputRef.current?.click();
@@ -197,53 +302,84 @@ export function ImagePdfToExcelTool() {
     [],
   );
 
+  const queueCardMotion = queueExiting
+    ? "pointer-events-none opacity-0 translate-y-2 scale-[0.99]"
+    : queueCardVisible
+      ? "opacity-100 translate-y-0 scale-100"
+      : "opacity-0 translate-y-4 scale-[0.98]";
+
+  const runPanelMotion = runPanelVisible
+    ? "opacity-100 translate-y-0"
+    : "opacity-0 translate-y-4";
+
   return (
     <div className="mx-auto w-full max-w-3xl space-y-6">
-      <div
-        className={[
-          "rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface)] p-8 transition",
-          isDragging ? "border-[color:var(--accent)] ring-2 ring-[color:var(--accent)]/30" : "",
-          isBusy ? "opacity-70" : "",
-        ].join(" ")}
-        onDragEnter={(e) => {
-          e.preventDefault();
-          setIsDragging(true);
-        }}
-        onDragOver={(e) => {
-          e.preventDefault();
-          setIsDragging(true);
-        }}
-        onDragLeave={() => setIsDragging(false)}
-        onDrop={onDrop}
-      >
-        <div className="flex flex-col items-center text-center">
-          <p className="text-sm text-[color:var(--muted)]">{hint}</p>
-          <p className="mt-3 text-lg font-medium">Drag and drop files here</p>
-          <p className="mt-1 text-sm text-[color:var(--muted)]">or</p>
+      <input
+        ref={inputRef}
+        type="file"
+        accept={ACCEPT_ATTR}
+        multiple
+        className="hidden"
+        onChange={onInputChange}
+        disabled={isBusy}
+      />
 
-          <input
-            ref={inputRef}
-            type="file"
-            accept={ACCEPT_ATTR}
-            multiple
-            className="hidden"
-            onChange={onInputChange}
-            disabled={isBusy}
-          />
+      {showDropzone ? (
+        <div
+          className={[
+            "rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface)] p-8 transition",
+            isDragging ? "border-[color:var(--accent)] ring-2 ring-[color:var(--accent)]/30" : "",
+            isBusy ? "opacity-70" : "",
+          ].join(" ")}
+          onDragEnter={(e) => {
+            e.preventDefault();
+            setIsDragging(true);
+          }}
+          onDragOver={(e) => {
+            e.preventDefault();
+            setIsDragging(true);
+          }}
+          onDragLeave={() => setIsDragging(false)}
+          onDrop={onDrop}
+        >
+          <div className="flex flex-col items-center text-center">
+            <p className="text-sm text-[color:var(--muted)]">{hint}</p>
+            <p className="mt-3 text-lg font-medium">Drag and drop files here</p>
+            <p className="mt-1 text-sm text-[color:var(--muted)]">or</p>
 
+            <button
+              type="button"
+              onClick={onPickFile}
+              disabled={isBusy}
+              className="mt-5 inline-flex items-center justify-center rounded-xl bg-[color:var(--accent)] px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-[color:var(--accent-hover)] disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Choose files
+            </button>
+          </div>
+        </div>
+      ) : null}
+
+      {showAddMore ? (
+        <div className="flex flex-wrap items-center justify-end gap-2">
           <button
             type="button"
             onClick={onPickFile}
-            disabled={isBusy}
-            className="mt-5 inline-flex items-center justify-center rounded-xl bg-[color:var(--accent)] px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-[color:var(--accent-hover)] disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={queueActionsDisabled}
+            className="rounded-xl border border-[color:var(--border)] bg-[color:var(--surface)] px-4 py-2 text-sm font-semibold text-[color:var(--text)] transition hover:bg-[color:var(--bg)] disabled:cursor-not-allowed disabled:opacity-50"
           >
-            Choose files
+            Add more files
           </button>
         </div>
-      </div>
+      ) : null}
 
-      {queue.length > 0 ? (
-        <div className="rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface)] p-5">
+      {showQueuePanel ? (
+        <div
+          className={[
+            "rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface)] p-5 transition-all will-change-transform",
+            QUEUE_ENTER_TRANSITION,
+            queueCardMotion,
+          ].join(" ")}
+        >
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <p className="text-sm font-semibold">Queued files ({queue.length})</p>
@@ -255,15 +391,15 @@ export function ImagePdfToExcelTool() {
               <button
                 type="button"
                 onClick={clearQueue}
-                disabled={isBusy}
+                disabled={queueActionsDisabled}
                 className="rounded-xl border border-[color:var(--border)] px-3 py-2 text-sm font-semibold text-[color:var(--text)] transition hover:bg-[color:var(--bg)] disabled:cursor-not-allowed disabled:opacity-50"
               >
                 Clear
               </button>
               <button
                 type="button"
-                onClick={handleConvert}
-                disabled={isBusy}
+                onClick={requestGenerate}
+                disabled={queueActionsDisabled}
                 className="rounded-xl bg-[color:var(--accent)] px-4 py-2 text-sm font-semibold text-white transition hover:bg-[color:var(--accent-hover)] disabled:cursor-not-allowed disabled:opacity-50"
               >
                 Generate Excel
@@ -287,7 +423,7 @@ export function ImagePdfToExcelTool() {
                 <button
                   type="button"
                   onClick={() => removeFromQueue(index)}
-                  disabled={isBusy}
+                  disabled={queueActionsDisabled}
                   className="shrink-0 rounded-lg px-2 py-1 text-xs font-semibold text-[color:var(--muted)] transition hover:bg-[color:var(--surface)] hover:text-[color:var(--text)] disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   Remove
@@ -299,18 +435,68 @@ export function ImagePdfToExcelTool() {
       ) : null}
 
       {isBusy ? (
-        <div className="rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface)] p-6">
+        <div
+          className={[
+            "rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface)] p-6 transition-all duration-300 ease-out will-change-transform",
+            runPanelMotion,
+          ].join(" ")}
+        >
           <div className="flex items-start gap-4">
             <div
               className="mt-1 h-5 w-5 shrink-0 animate-spin rounded-full border-2 border-[color:var(--border)] border-t-[color:var(--accent)]"
               aria-hidden
             />
-            <div>
-              <p className="font-medium">Running Vision OCR and Claude</p>
-              <p className="mt-1 text-sm text-[color:var(--muted)]">
-                Google Cloud Vision is extracting text from {queue.length} file
-                {queue.length === 1 ? "" : "s"} (PDFs are rasterized page-by-page), then Claude
-                builds the bilingual workbook. This can take several minutes for many pages.
+            <div className="min-w-0 flex-1 space-y-4">
+              <div>
+                <p className="font-medium">Running conversion</p>
+                <p className="mt-1 text-xs text-[color:var(--muted)]">
+                  Large batches and long PDFs can take several minutes. The steps below mirror the
+                  server pipeline; the highlighted stage advances while the request is in flight.
+                </p>
+              </div>
+
+              <ol className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-stretch sm:gap-3">
+                {(
+                  [
+                    { id: "ocr" as const, title: "1 · OCR", sub: "Google Cloud Vision" },
+                    { id: "claude" as const, title: "2 · Claude", sub: "Structured bilingual rows" },
+                    { id: "excel" as const, title: "3 · Excel", sub: "Workbook generation" },
+                  ] as const
+                ).map(({ id, title, sub }) => {
+                  const vis = stepVisual(id);
+                  return (
+                    <li
+                      key={id}
+                      className={[
+                        "flex min-w-0 flex-1 flex-col rounded-xl border px-3 py-2.5 text-left text-xs transition-colors",
+                        vis === "active"
+                          ? "border-[color:var(--accent)]/50 bg-[color:var(--accent)]/10 ring-1 ring-[color:var(--accent)]/35"
+                          : vis === "done"
+                            ? "border-emerald-500/25 bg-emerald-500/5"
+                            : "border-[color:var(--border)] bg-[color:var(--bg)] opacity-60",
+                      ].join(" ")}
+                    >
+                      <span className="font-semibold text-[color:var(--text)]">{title}</span>
+                      <span className="mt-0.5 text-[color:var(--muted)]">{sub}</span>
+                      {vis === "active" ? (
+                        <span className="mt-1.5 inline-flex items-center gap-1 font-medium text-[color:var(--accent)]">
+                          <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[color:var(--accent)]" />
+                          In progress
+                        </span>
+                      ) : null}
+                      {vis === "done" ? (
+                        <span className="mt-1.5 font-medium text-emerald-400/90">Complete</span>
+                      ) : null}
+                    </li>
+                  );
+                })}
+              </ol>
+
+              <p
+                key={activePipelineStage}
+                className="text-sm leading-relaxed text-[color:var(--muted)] motion-safe:animate-rmk-fade-in"
+              >
+                {pipelineCopy[activePipelineStage]}
               </p>
             </div>
           </div>
