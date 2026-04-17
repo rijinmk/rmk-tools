@@ -53,6 +53,9 @@ type PipelineStage = "ocr" | "claude" | "excel";
 const QUEUE_EXIT_MS = 320;
 const QUEUE_ENTER_TRANSITION = "duration-300 ease-out";
 
+/** Vercel (and similar) reject the whole HTTP request around ~4.5 MB; `next dev` does not. */
+const HOSTED_REQUEST_WARNING_BYTES = 4_000_000;
+
 function pipelineStageFromElapsed(ms: number): PipelineStage {
   if (ms < 22_000) return "ocr";
   if (ms < 55_000) return "claude";
@@ -331,9 +334,16 @@ export function ImagePdfToExcelTool() {
 
   const hint = useMemo(
     () =>
-      `Add multiple PDFs and/or images (PNG, JPEG, WebP, GIF). Up to ${25} files, 30 MB each. You will get one .xlsx with one row per file.`,
+      `Add multiple PDFs and/or images (PNG, JPEG, WebP, GIF). Up to ${25} files, 30 MB each. You will get one .xlsx with one row per file. On Vercel, the full request must stay under ~4.5 MB (local dev has no such cap).`,
     [],
   );
+
+  const queueTotalBytes = useMemo(
+    () => queue.reduce((sum, file) => sum + file.size, 0),
+    [queue],
+  );
+
+  const queueLikelyTooLargeForVercel = queueTotalBytes > HOSTED_REQUEST_WARNING_BYTES;
 
   const queueCardMotion = queueExiting
     ? "pointer-events-none opacity-0 translate-y-2 scale-[0.99]"
@@ -419,6 +429,14 @@ export function ImagePdfToExcelTool() {
               <p className="mt-1 text-xs text-[color:var(--muted)]">
                 Order is preserved — row 1 matches the first file in this list.
               </p>
+              {queueLikelyTooLargeForVercel ? (
+                <p className="mt-2 rounded-lg border border-amber-500/35 bg-amber-500/10 px-2.5 py-2 text-xs text-amber-100/95">
+                  Total {formatBytes(queueTotalBytes)}: many hosts (e.g. Vercel) return{" "}
+                  <strong className="font-semibold">413</strong> if the whole upload is over ~4.5 MB.
+                  Use fewer or smaller files, split runs, or run <code className="rounded bg-black/20 px-1">npm run dev</code>{" "}
+                  locally—local Next.js does not apply that limit.
+                </p>
+              ) : null}
             </div>
             <div className="flex flex-wrap gap-2">
               <button
