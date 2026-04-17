@@ -7,7 +7,8 @@ import { isToolUnlocked, TOOL_UNLOCK_COOKIE } from "@/lib/toolAuth";
 export const runtime = "nodejs";
 
 /**
- * Tells the client whether direct-to-Blob uploads are available (tool unlocked + token on server).
+ * Tells the client whether the Blob-backed path is available (tool unlocked + token on server).
+ * Uploads use POST /api/blobs/ingest (server put), not browser PUT to blob.vercel-storage.com.
  */
 export async function GET() {
   if (!process.env.PASSWORD?.trim()) {
@@ -20,7 +21,7 @@ export async function GET() {
   return NextResponse.json({
     toolUnlocked,
     blobTokenSet,
-    /** True only when the browser may use client → Blob uploads for this session. */
+    /** True when the app may upload each file via /api/blobs/ingest for this session. */
     clientUpload: toolUnlocked && blobTokenSet,
   });
 }
