@@ -61,6 +61,32 @@ const HOSTED_REQUEST_WARNING_BYTES = 2_500_000;
 
 const BLOB_PATH_PREFIX = "flyer-uploads/";
 
+/**
+ * Blob pathnames must be stable ASCII — spaces, "+", and parentheses in query strings
+ * can break token/path matching and surface as "CORS" errors (browser hides 400 bodies).
+ */
+function blobUploadPathname(file: File, index: number): string {
+  const match = /\.([a-z0-9]+)$/i.exec(file.name.trim());
+  const ext = (match?.[1] || "bin").toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 8) || "bin";
+  const id =
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `${Date.now()}-${index}-${Math.random().toString(16).slice(2)}`;
+  return `${BLOB_PATH_PREFIX}${id}-${index}.${ext}`;
+}
+
+function inferredMimeForBlob(file: File): string {
+  const t = file.type?.trim();
+  if (t && t !== "application/octet-stream") return t;
+  const lower = file.name.toLowerCase();
+  if (lower.endsWith(".pdf")) return "application/pdf";
+  if (lower.endsWith(".png")) return "image/png";
+  if (lower.endsWith(".webp")) return "image/webp";
+  if (lower.endsWith(".gif")) return "image/gif";
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+  return "application/octet-stream";
+}
+
 function pipelineStageFromElapsed(ms: number): PipelineStage {
   if (ms < 22_000) return "ocr";
   if (ms < 55_000) return "claude";
@@ -183,18 +209,30 @@ export function ImagePdfToExcelTool() {
         if (blobOk) {
           usedBlobUploadPath = true;
           const { upload } = await import("@vercel/blob/client");
+          const handleUploadUrl = `${window.location.origin}/api/blobs/client-upload`;
           const blobFiles: { url: string; name: string }[] = [];
           for (let i = 0; i < files.length; i += 1) {
             const file = files[i];
-            const safeName = file.name.replace(/[^\w.\-()+ ]/g, "_").slice(0, 160);
-            const pathname = `${BLOB_PATH_PREFIX}${Date.now()}-${i}-${safeName}`;
-            const uploaded = await upload(pathname, file, {
-              access: "public",
-              handleUploadUrl: "/api/blobs/client-upload",
-              multipart: file.size >= 4 * 1024 * 1024,
-              contentType: file.type || undefined,
-            });
-            blobFiles.push({ url: uploaded.url, name: file.name });
+            const pathname = blobUploadPathname(file, i);
+            try {
+              const uploaded = await upload(pathname, file, {
+                access: "public",
+                handleUploadUrl,
+                multipart: file.size >= 6 * 1024 * 1024,
+                contentType: inferredMimeForBlob(file),
+              });
+              blobFiles.push({ url: uploaded.url, name: file.name });
+            } catch (blobErr) {
+              const msg = blobErr instanceof Error ? blobErr.message : String(blobErr);
+              throw new Error(
+                [
+                  `Upload to Blob failed for “${file.name}”: ${msg}`,
+                  "",
+                  "If DevTools shows a CORS error on blob.vercel-storage.com, the Blob API often returned 400 without CORS headers (the browser message is misleading).",
+                  "Common fixes: redeploy after adding BLOB_READ_WRITE_TOKEN for this Preview environment; keep filenames with unusual characters (they are ignored for the blob path now).",
+                ].join("\n"),
+              );
+            }
           }
           res = await fetch("/api/convert", {
             method: "POST",
