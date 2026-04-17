@@ -31,8 +31,10 @@ export default function FlyerToExcelToolPage() {
         </h1>
         <p className="mt-3 max-w-2xl text-sm leading-6 text-[color:var(--muted)] sm:text-base">
           Queue PDFs and/or images. Google Cloud Vision extracts text (PDFs are rendered per
-          page); Claude turns OCR text into bilingual rows. You get a summary, optional Vision
-          JSON for debugging, and one .xlsx download.
+          page); Claude turns OCR text into bilingual rows. On Vercel, large batches upload
+          straight to Blob when <code className="text-[color:var(--text)]">BLOB_READ_WRITE_TOKEN</code>{" "}
+          is set, avoiding the small serverless request-body cap. You get a summary, optional
+          Vision JSON for debugging, and one .xlsx download.
         </p>
       </header>
 

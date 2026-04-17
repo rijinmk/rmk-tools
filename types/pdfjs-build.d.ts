@@ -18,6 +18,9 @@ type PdfGetDocumentParams = {
 };
 
 declare module "pdfjs-dist/legacy/build/pdf.mjs" {
+  /** Fake-worker path for Node; set to a `file://` URL of `pdf.worker.mjs` on Vercel/Next. */
+  export const GlobalWorkerOptions: { workerSrc: string };
+
   export interface PDFRenderTask {
     promise: Promise<void>;
   }

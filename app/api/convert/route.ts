@@ -2,6 +2,8 @@ import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
 
 import { convertLog, convertLogError } from "@/lib/convertPipelineLog";
+import { getBlobReadWriteToken } from "@/lib/blobEnv";
+import { prepareSourceFiles } from "@/lib/convertInputs";
 import { isToolUnlocked, TOOL_UNLOCK_COOKIE } from "@/lib/toolAuth";
 import {
   collectTextFromMessage,
@@ -18,40 +20,6 @@ import {
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
-
-const MAX_BYTES_PER_FILE = 30 * 1024 * 1024;
-const MAX_FILES = 25;
-
-const ALLOWED_MIME = new Set([
-  "application/pdf",
-  "image/png",
-  "image/jpeg",
-  "image/webp",
-  "image/gif",
-]);
-
-function resolveMime(file: File): string {
-  if (ALLOWED_MIME.has(file.type)) {
-    return file.type;
-  }
-
-  const ext = file.name.split(".").pop()?.toLowerCase();
-  switch (ext) {
-    case "pdf":
-      return "application/pdf";
-    case "png":
-      return "image/png";
-    case "jpg":
-    case "jpeg":
-      return "image/jpeg";
-    case "webp":
-      return "image/webp";
-    case "gif":
-      return "image/gif";
-    default:
-      return file.type || "application/octet-stream";
-  }
-}
 
 function isOfferRow(v: unknown): v is OfferRow {
   if (!v || typeof v !== "object") return false;
@@ -71,23 +39,6 @@ function isBatchPayload(
   const obj = v as { summary?: unknown; rows?: unknown };
   if (typeof obj.summary !== "string" || !Array.isArray(obj.rows)) return false;
   return obj.rows.every((row) => isOfferRow(row));
-}
-
-function collectUploadedFiles(form: FormData): File[] {
-  const fromMulti = form
-    .getAll("files")
-    .filter((entry): entry is File => entry instanceof File && entry.size > 0);
-
-  if (fromMulti.length > 0) {
-    return fromMulti;
-  }
-
-  const single = form.get("file");
-  if (single instanceof File && single.size > 0) {
-    return [single];
-  }
-
-  return [];
 }
 
 export async function POST(req: Request) {
@@ -134,52 +85,31 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: msg, pipelineStep }, { status: 500 });
     }
 
-    pipelineStep = "parse-formdata";
-    const form = await req.formData();
-    const files = collectUploadedFiles(form);
-
-    if (files.length === 0) {
-      return NextResponse.json(
-        { error: "Upload at least one PDF or image (use the files field)." },
-        { status: 400 },
-      );
+    pipelineStep = "parse-input";
+    let files!: Awaited<ReturnType<typeof prepareSourceFiles>>["files"];
+    let blobUrlsToDelete: string[] = [];
+    try {
+      const prepared = await prepareSourceFiles(req, {
+        blobReadWriteToken: getBlobReadWriteToken(),
+      });
+      files = prepared.files;
+      blobUrlsToDelete = prepared.blobUrlsToDelete;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Invalid request body.";
+      return NextResponse.json({ error: msg, pipelineStep }, { status: 400 });
     }
 
     convertLog("api", "files.accepted", {
       count: files.length,
       names: files.map((f) => f.name).join("|"),
+      viaBlob: blobUrlsToDelete.length > 0,
     });
-
-    if (files.length > MAX_FILES) {
-      return NextResponse.json(
-        { error: `Too many files (max ${MAX_FILES}).` },
-        { status: 400 },
-      );
-    }
-
-    for (const file of files) {
-      const mime = resolveMime(file);
-      if (!ALLOWED_MIME.has(mime)) {
-        return NextResponse.json(
-          {
-            error: `Unsupported type for “${file.name}”. Use PDF, PNG, JPEG, WebP, or GIF.`,
-          },
-          { status: 400 },
-        );
-      }
-      if (file.size > MAX_BYTES_PER_FILE) {
-        return NextResponse.json(
-          { error: `“${file.name}” is too large (max 30 MB per file).` },
-          { status: 400 },
-        );
-      }
-    }
 
     const visionLogs: VisionFileExtractionLog[] = [];
 
     for (let i = 0; i < files.length; i += 1) {
       const file = files[i];
-      const mime = resolveMime(file);
+      const mime = file.mime;
       pipelineStep = `vision:file-${i + 1}-of-${files.length}:${file.name}`;
       convertLog("api", "vision.file.start", {
         index: i,
@@ -187,8 +117,7 @@ export async function POST(req: Request) {
         mime,
         sizeBytes: file.size,
       });
-      const buffer = Buffer.from(await file.arrayBuffer());
-      const log = await extractTextWithVision(buffer, mime, file.name, i);
+      const log = await extractTextWithVision(file.buffer, mime, file.name, i);
       visionLogs.push(log);
       convertLog("api", "vision.file.done", { index: i, fileName: file.name });
     }
@@ -340,6 +269,26 @@ Hard rules:
 
     pipelineStep = "done";
     convertLog("api", "request.success", { downloadName });
+
+    const blobRw = getBlobReadWriteToken();
+    if (blobUrlsToDelete.length > 0 && blobRw) {
+      pipelineStep = "blob:cleanup";
+      try {
+        const { del } = await import("@vercel/blob");
+        const token = blobRw;
+        await Promise.all(
+          blobUrlsToDelete.map((url) =>
+            del(url, { token }).catch(() => {
+              /* best-effort cleanup */
+            }),
+          ),
+        );
+        convertLog("api", "blob.cleanup.done", { count: blobUrlsToDelete.length });
+      } catch (cleanupErr) {
+        convertLogError("api", cleanupErr, { pipelineStep });
+      }
+    }
+
     return NextResponse.json({
       summary: parsed.summary,
       excelBase64,

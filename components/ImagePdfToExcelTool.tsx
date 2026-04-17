@@ -3,6 +3,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 
+import { BLOB_INGEST_MAX_BYTES } from "@/lib/blobIngestLimits";
+
 type Phase = "idle" | "uploading" | "success" | "error";
 
 type VisionDebugPayload = {
@@ -53,8 +55,11 @@ type PipelineStage = "ocr" | "claude" | "excel";
 const QUEUE_EXIT_MS = 320;
 const QUEUE_ENTER_TRANSITION = "duration-300 ease-out";
 
-/** Vercel (and similar) reject the whole HTTP request around ~4.5 MB; `next dev` does not. */
-const HOSTED_REQUEST_WARNING_BYTES = 4_000_000;
+/** Stay under Vercel’s ~4.5 MB multipart cap (multipart boundaries add a lot of overhead). */
+const MULTIPART_SAFE_TOTAL_BYTES = 2_500_000;
+
+/** Warn in the queue UI above this size when Blob is not available. */
+const HOSTED_REQUEST_WARNING_BYTES = 2_500_000;
 
 function pipelineStageFromElapsed(ms: number): PipelineStage {
   if (ms < 22_000) return "ocr";
@@ -79,8 +84,21 @@ export function ImagePdfToExcelTool() {
   const [runPanelVisible, setRunPanelVisible] = useState(false);
   const [uploadTick, setUploadTick] = useState(0);
   const [convertFileCount, setConvertFileCount] = useState(0);
+  const [blobDirectUpload, setBlobDirectUpload] = useState(false);
 
   const isBusy = phase === "uploading";
+
+  useEffect(() => {
+    const load = () => {
+      void fetch("/api/blobs/ready", { credentials: "include" })
+        .then((r) => r.json() as Promise<{ clientUpload?: boolean }>)
+        .then((d) => setBlobDirectUpload(Boolean(d.clientUpload)))
+        .catch(() => setBlobDirectUpload(false));
+    };
+    load();
+    window.addEventListener("rmk-tools-session", load);
+    return () => window.removeEventListener("rmk-tools-session", load);
+  }, []);
 
   const revokeBlobUrl = useCallback(() => {
     setExcelBlobUrl((prev) => {
@@ -127,17 +145,102 @@ export function ImagePdfToExcelTool() {
       revokeBlobUrl();
       setPhase("uploading");
 
-      const form = new FormData();
-      for (const file of files) {
-        form.append("files", file);
-      }
-
+      let res: Response;
+      let usedBlobUploadPath = false;
       try {
-        const res = await fetch("/api/convert", {
-          method: "POST",
-          body: form,
-          credentials: "include",
-        });
+        const totalBytes = files.reduce((sum, f) => sum + f.size, 0);
+        const readyRes = await fetch("/api/blobs/ready", { credentials: "include" });
+        const readyJson = (await readyRes.json()) as {
+          clientUpload?: boolean;
+          toolUnlocked?: boolean;
+          blobTokenSet?: boolean;
+        };
+        const blobOk = Boolean(readyJson.clientUpload);
+        const toolUnlocked = readyJson.toolUnlocked !== false;
+        const blobTokenSet = Boolean(readyJson.blobTokenSet);
+
+        if (totalBytes > MULTIPART_SAFE_TOTAL_BYTES && !blobOk) {
+          const sizeMb = (totalBytes / (1024 * 1024)).toFixed(1);
+          if (!toolUnlocked) {
+            throw new Error(
+              `This batch is about ${sizeMb} MB. Unlock the tool again (password), then retry so the app can upload each file to Blob via the server (avoids the ~4.5 MB single-request cap).`,
+            );
+          }
+          if (!blobTokenSet) {
+            throw new Error(
+              [
+                `This batch is about ${sizeMb} MB. Vercel blocks the normal upload path over ~4.5 MB.`,
+                "",
+                "Fix (one-time): Vercel → your project → Storage → Blob → create or connect a store linked to this project. That injects BLOB_READ_WRITE_TOKEN (or VERCEL_BLOB_READ_WRITE_TOKEN) for Production — check Settings → Environment Variables after linking.",
+                "Then: Deployments → Redeploy. Open this tool, enter the password again, and run Generate.",
+                "",
+                "Local: add BLOB_READ_WRITE_TOKEN to .env (vercel env pull) or run npm run dev without deploying.",
+              ].join("\n"),
+            );
+          }
+        }
+
+        if (blobOk) {
+          usedBlobUploadPath = true;
+          const oversized = files.filter((f) => f.size > BLOB_INGEST_MAX_BYTES);
+          if (oversized.length > 0) {
+            const maxMb = (BLOB_INGEST_MAX_BYTES / (1024 * 1024)).toFixed(1);
+            throw new Error(
+              [
+                `These files exceed ${maxMb} MB each (Vercel request limit for server → Blob upload):`,
+                ...oversized.map((f) => `• ${f.name} (${(f.size / (1024 * 1024)).toFixed(1)} MB)`),
+                "",
+                "Compress PDFs/images, split large PDFs, or run `npm run dev` locally where this limit does not apply.",
+              ].join("\n"),
+            );
+          }
+
+          const blobFiles: { url: string; name: string }[] = [];
+          for (const file of files) {
+            const fd = new FormData();
+            fd.append("file", file);
+            const up = await fetch("/api/blobs/ingest", {
+              method: "POST",
+              body: fd,
+              credentials: "include",
+            });
+            const raw = await up.text();
+            let parsed: unknown = null;
+            try {
+              parsed = raw.trim() ? JSON.parse(raw) : null;
+            } catch {
+              parsed = null;
+            }
+            const row =
+              parsed && typeof parsed === "object" && !Array.isArray(parsed)
+                ? (parsed as { url?: unknown; name?: unknown; error?: unknown })
+                : null;
+            if (!up.ok || typeof row?.url !== "string") {
+              const err =
+                typeof row?.error === "string"
+                  ? row.error
+                  : `Blob ingest failed for “${file.name}” (${up.status}).`;
+              throw new Error(err);
+            }
+            blobFiles.push({ url: row.url, name: typeof row.name === "string" ? row.name : file.name });
+          }
+          res = await fetch("/api/convert", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ blobFiles }),
+            credentials: "include",
+          });
+        } else {
+          const form = new FormData();
+          for (const file of files) {
+            form.append("files", file);
+          }
+          res = await fetch("/api/convert", {
+            method: "POST",
+            body: form,
+            credentials: "include",
+          });
+        }
 
         const rawText = await res.text();
         let payload: unknown = null;
@@ -165,7 +268,9 @@ export function ImagePdfToExcelTool() {
           const preview = rawText.replace(/\s+/g, " ").trim().slice(0, 280);
           const hint =
             res.status === 413
-              ? "Payload too large for the host (try fewer/smaller files)."
+              ? usedBlobUploadPath
+                ? "Request was still too large (unexpected)."
+                : "Payload too large for this host (~4.5 MB). In Vercel: add a Blob store and BLOB_READ_WRITE_TOKEN so each file can be sent to /api/blobs/ingest then Blob, or use fewer/smaller files / npm run dev locally."
               : res.status === 504 || res.status === 502
                 ? "Gateway timeout or bad gateway — conversion may exceed serverless limits; check Vercel function logs and maxDuration."
                 : "Often HTML from a proxy or an empty body when JSON was expected.";
@@ -334,7 +439,7 @@ export function ImagePdfToExcelTool() {
 
   const hint = useMemo(
     () =>
-      `Add multiple PDFs and/or images (PNG, JPEG, WebP, GIF). Up to ${25} files, 30 MB each. You will get one .xlsx with one row per file. On Vercel, the full request must stay under ~4.5 MB (local dev has no such cap).`,
+      `Add multiple PDFs and/or images (PNG, JPEG, WebP, GIF). Up to ${25} files, 30 MB each. One .xlsx row per file. On Vercel, set BLOB_READ_WRITE_TOKEN so each file uploads to Blob through the app (per-file cap about 4 MB on serverless; otherwise the multipart path is capped near ~4.5 MB).`,
     [],
   );
 
@@ -343,7 +448,8 @@ export function ImagePdfToExcelTool() {
     [queue],
   );
 
-  const queueLikelyTooLargeForVercel = queueTotalBytes > HOSTED_REQUEST_WARNING_BYTES;
+  const queueLikelyTooLargeForVercel =
+    queueTotalBytes > HOSTED_REQUEST_WARNING_BYTES && !blobDirectUpload;
 
   const queueCardMotion = queueExiting
     ? "pointer-events-none opacity-0 translate-y-2 scale-[0.99]"
@@ -431,10 +537,11 @@ export function ImagePdfToExcelTool() {
               </p>
               {queueLikelyTooLargeForVercel ? (
                 <p className="mt-2 rounded-lg border border-amber-500/35 bg-amber-500/10 px-2.5 py-2 text-xs text-amber-100/95">
-                  Total {formatBytes(queueTotalBytes)}: many hosts (e.g. Vercel) return{" "}
-                  <strong className="font-semibold">413</strong> if the whole upload is over ~4.5 MB.
-                  Use fewer or smaller files, split runs, or run <code className="rounded bg-black/20 px-1">npm run dev</code>{" "}
-                  locally—local Next.js does not apply that limit.
+                  Total {formatBytes(queueTotalBytes)}: without Blob configured, many hosts return{" "}
+                  <strong className="font-semibold">413</strong> (~4.5 MB request cap). Add{" "}
+                  <code className="rounded bg-black/20 px-1">BLOB_READ_WRITE_TOKEN</code> on the server
+                  (per-file ingest ~4 MB), split runs, or use{" "}
+                  <code className="rounded bg-black/20 px-1">npm run dev</code> locally.
                 </p>
               ) : null}
             </div>
