@@ -89,7 +89,9 @@ export async function POST(req: Request) {
     let files!: Awaited<ReturnType<typeof prepareSourceFiles>>["files"];
     let blobUrlsToDelete: string[] = [];
     try {
-      const prepared = await prepareSourceFiles(req);
+      const prepared = await prepareSourceFiles(req, {
+        blobReadWriteToken: getBlobReadWriteToken(),
+      });
       files = prepared.files;
       blobUrlsToDelete = prepared.blobUrlsToDelete;
     } catch (e) {

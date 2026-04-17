@@ -1,7 +1,7 @@
-import { put } from "@vercel/blob";
 import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
 
+import { putRespectingStoreAccess } from "@/lib/blobAdaptivePut";
 import { getBlobReadWriteToken } from "@/lib/blobEnv";
 import { BLOB_INGEST_MAX_BYTES } from "@/lib/blobIngestLimits";
 import { isToolUnlocked, TOOL_UNLOCK_COOKIE } from "@/lib/toolAuth";
@@ -76,8 +76,7 @@ export async function POST(request: Request) {
   const contentType = inferContentType(file);
 
   try {
-    const result = await put(pathname, buffer, {
-      access: "public",
+    const result = await putRespectingStoreAccess(pathname, buffer, {
       token,
       contentType,
     });

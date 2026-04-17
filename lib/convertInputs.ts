@@ -18,6 +18,16 @@ export type SourceFile = {
   buffer: Buffer;
 };
 
+/** Public store URLs; anonymous GET works. */
+export function isTrustedPublicVercelBlobHostname(hostname: string): boolean {
+  return hostname.toLowerCase().endsWith(".public.blob.vercel-storage.com");
+}
+
+/** Private store URLs; GET requires `Authorization: Bearer <read-write token>`. */
+export function isTrustedPrivateVercelBlobHostname(hostname: string): boolean {
+  return hostname.toLowerCase().endsWith(".private.blob.vercel-storage.com");
+}
+
 export function isTrustedVercelBlobUrl(urlString: string): boolean {
   let u: URL;
   try {
@@ -27,7 +37,39 @@ export function isTrustedVercelBlobUrl(urlString: string): boolean {
   }
   if (u.protocol !== "https:") return false;
   const h = u.hostname.toLowerCase();
-  return h.endsWith(".public.blob.vercel-storage.com");
+  return isTrustedPublicVercelBlobHostname(h) || isTrustedPrivateVercelBlobHostname(h);
+}
+
+async function fetchTrustedBlobObject(
+  url: string,
+  fileName: string,
+  blobReadWriteToken: string | null | undefined,
+): Promise<Response> {
+  let hostname: string;
+  try {
+    hostname = new URL(url).hostname;
+  } catch {
+    throw new Error(`Invalid blob URL for "${fileName}".`);
+  }
+
+  if (isTrustedPrivateVercelBlobHostname(hostname)) {
+    const token = blobReadWriteToken?.trim();
+    if (!token) {
+      throw new Error(
+        `Cannot read "${fileName}" from private Blob storage — server is missing BLOB_READ_WRITE_TOKEN (or VERCEL_BLOB_READ_WRITE_TOKEN).`,
+      );
+    }
+    return fetch(url, {
+      redirect: "follow",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+  }
+
+  if (isTrustedPublicVercelBlobHostname(hostname)) {
+    return fetch(url, { redirect: "follow" });
+  }
+
+  throw new Error(`URL not allowed for "${fileName}".`);
 }
 
 export function resolveMimeFromFile(file: File): string {
@@ -110,7 +152,15 @@ export function parseBlobFilesPayload(raw: unknown): { url: string; name: string
   return out;
 }
 
-export async function prepareSourceFiles(req: Request): Promise<{
+export type PrepareSourceFilesOptions = {
+  /** Required to fetch blobs uploaded to a private Vercel Blob store. */
+  blobReadWriteToken?: string | null;
+};
+
+export async function prepareSourceFiles(
+  req: Request,
+  options?: PrepareSourceFilesOptions,
+): Promise<{
   files: SourceFile[];
   blobUrlsToDelete: string[];
 }> {
@@ -138,11 +188,11 @@ export async function prepareSourceFiles(req: Request): Promise<{
     for (const { url, name } of entries) {
       if (!isTrustedVercelBlobUrl(url)) {
         throw new Error(
-          `URL not allowed for "${name}" — only https://*.public.blob.vercel-storage.com URLs from this app’s uploads are accepted.`,
+          `URL not allowed for "${name}" — only https://*.public.blob.vercel-storage.com or https://*.private.blob.vercel-storage.com URLs from this app’s Blob uploads are accepted.`,
         );
       }
 
-      const res = await fetch(url, { redirect: "follow" });
+      const res = await fetchTrustedBlobObject(url, name, options?.blobReadWriteToken);
       if (!res.ok) {
         throw new Error(`Could not read "${name}" from blob storage (HTTP ${res.status}).`);
       }
