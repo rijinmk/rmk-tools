@@ -5,10 +5,25 @@ import ReactMarkdown from "react-markdown";
 
 type Phase = "idle" | "uploading" | "success" | "error";
 
+type VisionDebugPayload = {
+  extractedAt: string;
+  projectId: string;
+  files: Array<{
+    index: number;
+    fileName: string;
+    mimeType: string;
+    source: string;
+    pageCount: number;
+    pages: Array<{ page: number; textLength: number; text: string }>;
+    combinedText: string;
+  }>;
+};
+
 type ConvertResponse = {
   summary: string;
   excelBase64: string;
   downloadName: string;
+  visionDebug?: VisionDebugPayload;
 };
 
 const ACCEPT_ATTR =
@@ -41,6 +56,7 @@ export function ImagePdfToExcelTool() {
   const [summary, setSummary] = useState<string | null>(null);
   const [downloadName, setDownloadName] = useState<string | null>(null);
   const [excelBlobUrl, setExcelBlobUrl] = useState<string | null>(null);
+  const [visionDebugJson, setVisionDebugJson] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
 
   const isBusy = phase === "uploading";
@@ -85,6 +101,7 @@ export function ImagePdfToExcelTool() {
     setError(null);
     setSummary(null);
     setDownloadName(null);
+    setVisionDebugJson(null);
     revokeBlobUrl();
     setPhase("uploading");
 
@@ -100,10 +117,22 @@ export function ImagePdfToExcelTool() {
       });
 
       const payload: unknown = await res.json().catch(() => null);
-      const obj = payload as Partial<ConvertResponse> & { error?: string };
+      const obj = payload as Partial<ConvertResponse> & {
+        error?: string;
+        visionDebug?: VisionDebugPayload;
+      };
 
       if (!res.ok) {
-        throw new Error(obj?.error || `Request failed (${res.status}).`);
+        if (obj.visionDebug) {
+          setVisionDebugJson(JSON.stringify(obj.visionDebug, null, 2));
+        }
+        const errObj = obj as { pipelineStep?: string; hint?: string };
+        const parts = [
+          obj?.error || `Request failed (${res.status}).`,
+          errObj.pipelineStep ? `Step: ${errObj.pipelineStep}` : "",
+          errObj.hint || "",
+        ].filter(Boolean);
+        throw new Error(parts.join("\n\n"));
       }
 
       if (
@@ -112,6 +141,10 @@ export function ImagePdfToExcelTool() {
         typeof obj.downloadName !== "string"
       ) {
         throw new Error("Unexpected server response shape.");
+      }
+
+      if (obj.visionDebug) {
+        setVisionDebugJson(JSON.stringify(obj.visionDebug, null, 2));
       }
 
       const blob = base64ToBlob(
@@ -273,10 +306,11 @@ export function ImagePdfToExcelTool() {
               aria-hidden
             />
             <div>
-              <p className="font-medium">Processing with Claude</p>
+              <p className="font-medium">Running Vision OCR and Claude</p>
               <p className="mt-1 text-sm text-[color:var(--muted)]">
-                Extracting text from {queue.length} file{queue.length === 1 ? "" : "s"}, then
-                building one bilingual workbook. This can take several minutes for many files.
+                Google Cloud Vision is extracting text from {queue.length} file
+                {queue.length === 1 ? "" : "s"} (PDFs are rasterized page-by-page), then Claude
+                builds the bilingual workbook. This can take several minutes for many pages.
               </p>
             </div>
           </div>
@@ -289,7 +323,17 @@ export function ImagePdfToExcelTool() {
           role="alert"
         >
           <p className="font-semibold">Could not convert</p>
-          <p className="mt-2 text-[color:var(--muted)]">{error}</p>
+          <p className="mt-2 whitespace-pre-wrap text-[color:var(--muted)]">{error}</p>
+          {visionDebugJson ? (
+            <details className="mt-4 rounded-xl border border-[color:var(--border)] bg-[color:var(--bg)] p-3 text-[color:var(--text)]">
+              <summary className="cursor-pointer text-xs font-semibold text-[color:var(--muted)]">
+                Vision OCR (JSON)
+              </summary>
+              <pre className="mt-2 max-h-96 overflow-auto whitespace-pre-wrap break-words font-mono text-xs text-[color:var(--muted)]">
+                {visionDebugJson}
+              </pre>
+            </details>
+          ) : null}
         </div>
       ) : null}
 
@@ -322,6 +366,21 @@ export function ImagePdfToExcelTool() {
                   Download Excel
                 </a>
               </div>
+            ) : null}
+
+            {visionDebugJson ? (
+              <details className="mt-6 rounded-xl border border-[color:var(--border)] bg-[color:var(--bg)] p-4">
+                <summary className="cursor-pointer text-sm font-semibold text-[color:var(--muted)]">
+                  Vision OCR (JSON) — verify extraction
+                </summary>
+                <p className="mt-2 text-xs text-[color:var(--muted)]">
+                  Same structure is printed to the server console as{" "}
+                  <code className="rounded bg-[color:var(--surface)] px-1">[vision] OCR complete</code>.
+                </p>
+                <pre className="mt-3 max-h-[28rem] overflow-auto whitespace-pre-wrap break-words font-mono text-xs text-[color:var(--text)]">
+                  {visionDebugJson}
+                </pre>
+              </details>
             ) : null}
           </div>
         </div>

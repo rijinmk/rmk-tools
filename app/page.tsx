@@ -11,10 +11,10 @@ export default function Home() {
           Flyers → bilingual Excel
         </h1>
         <p className="mt-3 max-w-2xl text-sm leading-6 text-[color:var(--muted)] sm:text-base">
-          Queue multiple PDFs and/or images, then generate one workbook. The server extracts
-          text from each file with Claude (in order), then asks Claude once to build matching
-          bilingual rows (English + Arabic titles and descriptions). You get a Markdown summary
-          plus a single .xlsx download.
+          Queue multiple PDFs and/or images, then generate one workbook. Text is extracted with
+          Google Cloud Vision (PDFs are rendered to images per page), then Claude turns that OCR
+          text into bilingual rows. You get a Markdown summary, a Vision JSON block for
+          verification, and one .xlsx download.
         </p>
       </header>
 

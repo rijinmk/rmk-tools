@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
-import type { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 
+import { convertLog, convertLogError } from "@/lib/convertPipelineLog";
 import {
   collectTextFromMessage,
   getAnthropicClient,
@@ -8,6 +8,11 @@ import {
 } from "@/lib/anthropic";
 import { parseJsonFromModelText } from "@/lib/jsonFromModel";
 import { buildOffersWorkbookBuffer, type OfferRow } from "@/lib/offerExcel";
+import { getVisionServiceAccountCredentials } from "@/lib/visionCredentials";
+import {
+  extractTextWithVision,
+  type VisionFileExtractionLog,
+} from "@/lib/visionExtract";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -44,49 +49,6 @@ function resolveMime(file: File): string {
     default:
       return file.type || "application/octet-stream";
   }
-}
-
-function buildFileContentBlocks(base64: string, mime: string): ContentBlockParam[] {
-  if (mime === "application/pdf") {
-    return [
-      {
-        type: "document",
-        source: {
-          type: "base64",
-          media_type: "application/pdf",
-          data: base64,
-        },
-      },
-      {
-        type: "text",
-        text: `Extract ALL readable text from this PDF as faithfully as possible.
-
-Preserve reading order. Include headings, labels, captions, promo codes, phone numbers, emails, URLs, prices, dates, and any obvious tables. If something is clearly a table, represent it in a grid-like way using line breaks and spacing or tabs so the structure is obvious.
-
-Do not summarize. Output plain extracted text only.`,
-      },
-    ];
-  }
-
-  const imageMime = mime as "image/png" | "image/jpeg" | "image/webp" | "image/gif";
-  return [
-    {
-      type: "image",
-      source: {
-        type: "base64",
-        media_type: imageMime,
-        data: base64,
-      },
-    },
-    {
-      type: "text",
-      text: `Extract ALL readable text from this image as faithfully as possible.
-
-Preserve reading order. Include headings, labels, captions, promo codes, phone numbers, emails, URLs, prices, dates, and any obvious tables. If something is clearly a table, represent it in a grid-like way using line breaks and spacing or tabs so the structure is obvious.
-
-Do not summarize. Output plain extracted text only.`,
-    },
-  ];
 }
 
 function isOfferRow(v: unknown): v is OfferRow {
@@ -127,7 +89,10 @@ function collectUploadedFiles(form: FormData): File[] {
 }
 
 export async function POST(req: Request) {
+  let pipelineStep = "start";
   try {
+    convertLog("api", "request.received", {});
+    pipelineStep = "check-anthropic-key";
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey) {
       return NextResponse.json(
@@ -136,6 +101,20 @@ export async function POST(req: Request) {
       );
     }
 
+    pipelineStep = "check-vision-credentials";
+    let visionCredsJson: Record<string, string>;
+    try {
+      visionCredsJson = getVisionServiceAccountCredentials();
+      convertLog("api", "vision.credentials.ok", {
+        projectId: visionCredsJson.project_id,
+      });
+    } catch (e) {
+      convertLogError("api", e, { pipelineStep });
+      const msg = e instanceof Error ? e.message : "Invalid Vision credentials.";
+      return NextResponse.json({ error: msg, pipelineStep }, { status: 500 });
+    }
+
+    pipelineStep = "parse-formdata";
     const form = await req.formData();
     const files = collectUploadedFiles(form);
 
@@ -145,6 +124,11 @@ export async function POST(req: Request) {
         { status: 400 },
       );
     }
+
+    convertLog("api", "files.accepted", {
+      count: files.length,
+      names: files.map((f) => f.name).join("|"),
+    });
 
     if (files.length > MAX_FILES) {
       return NextResponse.json(
@@ -171,40 +155,68 @@ export async function POST(req: Request) {
       }
     }
 
-    const anthropic = getAnthropicClient();
-    const model = getModel();
-
-    const extracted: { fileName: string; text: string }[] = [];
+    const visionLogs: VisionFileExtractionLog[] = [];
 
     for (let i = 0; i < files.length; i += 1) {
       const file = files[i];
       const mime = resolveMime(file);
-      const arrayBuffer = await file.arrayBuffer();
-      const base64 = Buffer.from(arrayBuffer).toString("base64");
-
-      const extractMessage = await anthropic.messages.create({
-        model,
-        max_tokens: 16384,
-        messages: [
-          {
-            role: "user",
-            content: buildFileContentBlocks(base64, mime),
-          },
-        ],
+      pipelineStep = `vision:file-${i + 1}-of-${files.length}:${file.name}`;
+      convertLog("api", "vision.file.start", {
+        index: i,
+        fileName: file.name,
+        mime,
+        sizeBytes: file.size,
       });
+      const buffer = Buffer.from(await file.arrayBuffer());
+      const log = await extractTextWithVision(buffer, mime, file.name, i);
+      visionLogs.push(log);
+      convertLog("api", "vision.file.done", { index: i, fileName: file.name });
+    }
 
-      const text = collectTextFromMessage(extractMessage);
-      if (!text) {
+    const visionPayload = {
+      extractedAt: new Date().toISOString(),
+      projectId: visionCredsJson.project_id,
+      files: visionLogs.map((entry) => ({
+        index: entry.index,
+        fileName: entry.fileName,
+        mimeType: entry.mimeType,
+        source: entry.source,
+        pageCount: entry.pages.length,
+        pages: entry.pages.map((p) => ({
+          page: p.page,
+          textLength: p.textLength,
+          text: p.text,
+        })),
+        combinedText: entry.combinedText,
+      })),
+    };
+
+    console.log(`[vision] OCR complete — ${JSON.stringify(visionPayload, null, 2)}`);
+    convertLog("api", "vision.all.complete", {
+      fileCount: visionLogs.length,
+    });
+
+    const extracted = visionLogs.map((v) => ({
+      fileName: v.fileName,
+      text: v.combinedText,
+    }));
+
+    for (const item of extracted) {
+      if (!item.text?.trim()) {
         return NextResponse.json(
           {
-            error: `Claude returned no extracted text for “${file.name}”. Try a different file.`,
+            error: `Vision OCR returned no text for “${item.fileName}”.`,
+            visionDebug: visionPayload,
           },
           { status: 422 },
         );
       }
-
-      extracted.push({ fileName: file.name, text });
     }
+
+    pipelineStep = "claude:init-client";
+    const anthropic = getAnthropicClient();
+    const model = getModel();
+    convertLog("claude", "client.ready", { model });
 
     const bundleText = extracted
       .map(
@@ -213,6 +225,11 @@ export async function POST(req: Request) {
       )
       .join("\n\n");
 
+    pipelineStep = "claude:messages.create";
+    convertLog("claude", "messages.create.start", {
+      maxTokens: 20000,
+      bundleChars: bundleText.length,
+    });
     const sheetMessage = await anthropic.messages.create({
       model,
       max_tokens: 20000,
@@ -224,9 +241,9 @@ export async function POST(req: Request) {
               type: "text",
               text: `You are preparing ONE Excel-style dataset for hotel / travel / corporate offer flyers.
 
-You will receive ${extracted.length} extracted text blocks in STRICT UPLOAD ORDER (FILE 1, FILE 2, ...). You MUST output EXACTLY ${extracted.length} rows in the SAME order — one row per uploaded file (even if a PDF contains multiple offers, still produce ONE combined row for that file).
+You will receive ${extracted.length} OCR text blocks in STRICT UPLOAD ORDER (FILE 1, FILE 2, ...). You MUST output EXACTLY ${extracted.length} rows in the SAME order — one row per uploaded file (even if a PDF contains multiple offers, still produce ONE combined row for that file).
 
-Extracted texts:
+OCR / extracted texts:
 ${bundleText}
 
 Return ONLY valid JSON (no markdown fences) using EXACTLY this shape:
@@ -253,6 +270,10 @@ Hard rules:
         },
       ],
     });
+    convertLog("claude", "messages.create.done", {
+      stopReason: sheetMessage.stop_reason,
+      outputBlocks: sheetMessage.content.length,
+    });
 
     const sheetRaw = collectTextFromMessage(sheetMessage);
     let parsed: unknown;
@@ -263,6 +284,7 @@ Hard rules:
         {
           error:
             "Claude returned workbook data that could not be parsed as JSON. Try again with fewer files or clearer sources.",
+          visionDebug: visionPayload,
         },
         { status: 422 },
       );
@@ -273,6 +295,7 @@ Hard rules:
         {
           error:
             "Claude returned JSON in an unexpected format. Try again or adjust the inputs.",
+          visionDebug: visionPayload,
         },
         { status: 422 },
       );
@@ -282,23 +305,38 @@ Hard rules:
       return NextResponse.json(
         {
           error: `Expected ${extracted.length} rows from Claude, got ${parsed.rows.length}. Try again.`,
+          visionDebug: visionPayload,
         },
         { status: 422 },
       );
     }
 
-    const workbookBuffer = buildOffersWorkbookBuffer(parsed.rows);
+    pipelineStep = "excel:build-workbook";
+    convertLog("excel", "build.start", { rows: parsed.rows.length });
+    const workbookBuffer = await buildOffersWorkbookBuffer(parsed.rows);
+    convertLog("excel", "build.done", { xlsxBytes: workbookBuffer.length });
     const excelBase64 = workbookBuffer.toString("base64");
     const downloadName = `offer-flyers.xlsx`;
 
+    pipelineStep = "done";
+    convertLog("api", "request.success", { downloadName });
     return NextResponse.json({
       summary: parsed.summary,
       excelBase64,
       downloadName,
+      visionDebug: visionPayload,
     });
   } catch (err) {
+    convertLogError("api", err, { pipelineStep });
     const message =
       err instanceof Error ? err.message : "Unexpected error while converting.";
-    return NextResponse.json({ error: message }, { status: 500 });
+    return NextResponse.json(
+      {
+        error: message,
+        pipelineStep,
+        hint: "Open the terminal where `npm run dev` is running and search for lines starting with [rmk-tools:convert].",
+      },
+      { status: 500 },
+    );
   }
 }

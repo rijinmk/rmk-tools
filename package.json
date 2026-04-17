@@ -10,11 +10,14 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
+    "@google-cloud/vision": "^4.3.3",
+    "@napi-rs/canvas": "^0.1.98",
+    "exceljs": "^4.4.0",
     "next": "^15.2.4",
+    "pdfjs-dist": "^4.10.38",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "react-markdown": "^10.1.0",
-    "xlsx": "^0.18.5"
+    "react-markdown": "^10.1.0"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3.3.1",
