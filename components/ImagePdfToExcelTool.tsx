@@ -136,21 +136,54 @@ export function ImagePdfToExcelTool() {
           credentials: "include",
         });
 
-        const payload: unknown = await res.json().catch(() => null);
-        const obj = payload as Partial<ConvertResponse> & {
-          error?: string;
-          visionDebug?: VisionDebugPayload;
-        };
+        const rawText = await res.text();
+        let payload: unknown = null;
+        if (rawText.trim()) {
+          try {
+            payload = JSON.parse(rawText) as unknown;
+          } catch {
+            payload = null;
+          }
+        }
+
+        const isRecord = (v: unknown): v is Record<string, unknown> =>
+          typeof v === "object" && v !== null && !Array.isArray(v);
+
+        const obj = isRecord(payload)
+          ? (payload as Partial<ConvertResponse> & {
+              error?: string;
+              visionDebug?: VisionDebugPayload;
+              pipelineStep?: string;
+              hint?: string;
+            })
+          : null;
+
+        if (!obj) {
+          const preview = rawText.replace(/\s+/g, " ").trim().slice(0, 280);
+          const hint =
+            res.status === 413
+              ? "Payload too large for the host (try fewer/smaller files)."
+              : res.status === 504 || res.status === 502
+                ? "Gateway timeout or bad gateway — conversion may exceed serverless limits; check Vercel function logs and maxDuration."
+                : "Often HTML from a proxy or an empty body when JSON was expected.";
+          throw new Error(
+            [
+              `Invalid or non-JSON response (${res.status} ${res.statusText || ""}).`,
+              hint,
+              preview ? `Body preview: ${preview}` : "Body: (empty)",
+            ].join("\n\n"),
+          );
+        }
 
         if (!res.ok) {
-          if (obj.visionDebug) {
-            setVisionDebugJson(JSON.stringify(obj.visionDebug, null, 2));
+          const vd = obj.visionDebug;
+          if (vd) {
+            setVisionDebugJson(JSON.stringify(vd, null, 2));
           }
-          const errObj = obj as { pipelineStep?: string; hint?: string };
           const parts = [
-            obj?.error || `Request failed (${res.status}).`,
-            errObj.pipelineStep ? `Step: ${errObj.pipelineStep}` : "",
-            errObj.hint || "",
+            obj.error || `Request failed (${res.status}).`,
+            obj.pipelineStep ? `Step: ${obj.pipelineStep}` : "",
+            obj.hint || "",
           ].filter(Boolean);
           throw new Error(parts.join("\n\n"));
         }
